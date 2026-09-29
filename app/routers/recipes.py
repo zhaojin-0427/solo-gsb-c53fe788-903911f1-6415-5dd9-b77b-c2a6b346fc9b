@@ -1,3 +1,4 @@
+import sqlalchemy as sa
 from fastapi import APIRouter, Depends, Response
 from sqlalchemy.orm import Session
 
@@ -53,6 +54,39 @@ def _get_version_or_404(db: Session, recipe: Recipe, version: int) -> RecipeVers
             404, "RECIPE_VERSION_NOT_FOUND", f"recipe {recipe.code!r} has no version {version}"
         )
     return rv
+
+
+def _fresh_status(db: Session, version_id) -> str | None:
+    """Re-read the committed status of a version row, bypassing the identity map.
+
+    Under READ COMMITTED this observes any concurrent transaction that committed
+    after our initial read, which is exactly the state a state-guarded write
+    just lost to. Returns None if the row no longer exists.
+    """
+    return db.execute(
+        sa.select(RecipeVersion.status).where(RecipeVersion.id == version_id)
+    ).scalar_one_or_none()
+
+
+def _raise_lost_race(db: Session, recipe: Recipe, version: int, version_id) -> None:
+    """Explain why a state-guarded write matched no row.
+
+    The row we read as a draft was either published (409) or deleted (404) by
+    a concurrent request that committed first. Status is a one-way latch
+    (draft -> published) and ids are never reused, so a row that still exists
+    at this point can only be published.
+    """
+    if _fresh_status(db, version_id) is None:
+        raise api_error(
+            404,
+            "RECIPE_VERSION_NOT_FOUND",
+            f"recipe {recipe.code!r} has no version {version}",
+        )
+    raise api_error(
+        409,
+        "RECIPE_VERSION_IMMUTABLE",
+        f"recipe {recipe.code!r} version {version} is published and immutable",
+    )
 
 
 @router.post("", status_code=201)
@@ -124,9 +158,22 @@ def replace_version(
             "RECIPE_VERSION_IMMUTABLE",
             f"recipe {recipe.code!r} version {version} is published and immutable",
         )
-    rv.items = [i.model_dump(mode="json") for i in body.items]
-    rv.yield_quantity = body.yield_quantity
-    rv.yield_unit = body.yield_unit
+    # Atomic compare-and-swap: the row is updated only if it is still a draft
+    # at write time. A concurrent publish that commits first flips the status
+    # and makes this statement match zero rows, so the published row and its
+    # content stay untouched.
+    result = db.execute(
+        sa.update(RecipeVersion)
+        .where(RecipeVersion.id == rv.id, RecipeVersion.status == "draft")
+        .values(
+            items=[i.model_dump(mode="json") for i in body.items],
+            yield_quantity=body.yield_quantity,
+            yield_unit=body.yield_unit,
+        )
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount == 0:
+        _raise_lost_race(db, recipe, version, rv.id)
     db.commit()
     db.refresh(rv)
     return serialize_version(rv)
@@ -143,7 +190,15 @@ def delete_version(code: str, version: int, db: Session = Depends(get_db)):
             "RECIPE_VERSION_IMMUTABLE",
             f"recipe {recipe.code!r} version {version} is published and immutable",
         )
-    db.delete(rv)
+    # Same compare-and-swap as replace: only a row that is still a draft at
+    # write time is deleted; a published row can never disappear.
+    result = db.execute(
+        sa.delete(RecipeVersion)
+        .where(RecipeVersion.id == rv.id, RecipeVersion.status == "draft")
+        .execution_options(synchronize_session=False)
+    )
+    if result.rowcount == 0:
+        _raise_lost_race(db, recipe, version, rv.id)
     db.commit()
     return Response(status_code=204)
 
@@ -154,8 +209,26 @@ def publish_version(code: str, version: int, db: Session = Depends(get_db)):
     recipe = _get_recipe_or_404(db, code)
     rv = _get_version_or_404(db, recipe, version)
     if rv.status != "published":
-        rv.status = "published"
-        rv.published_at = utcnow()
-        db.commit()
+        # Atomic compare-and-swap: flip draft -> published only if the row is
+        # still a draft at write time. If a draft write (PUT) committed first,
+        # this freezes the updated content; if a DELETE committed first, the
+        # row is gone and there is nothing to publish.
+        result = db.execute(
+            sa.update(RecipeVersion)
+            .where(RecipeVersion.id == rv.id, RecipeVersion.status == "draft")
+            .values(status="published", published_at=utcnow())
+            .execution_options(synchronize_session=False)
+        )
+        if result.rowcount == 0:
+            # Lost the race: a concurrent publish committed first (idempotent
+            # success below) or the draft was deleted (nothing to publish).
+            if _fresh_status(db, rv.id) is None:
+                raise api_error(
+                    404,
+                    "RECIPE_VERSION_NOT_FOUND",
+                    f"recipe {recipe.code!r} has no version {version}",
+                )
+        else:
+            db.commit()
         db.refresh(rv)
     return serialize_version(rv)

@@ -200,6 +200,10 @@ curl -X POST http://localhost:8000/recipes/cake/versions/1/publish
 - 质量单位支持：`mg`、`g`、`kg`、`oz`、`lb`
 - 可选 `yield_quantity`/`yield_unit` 指定批次产出（如烘焙失水）；缺省为各原料用量之和
 - 版本**发布后不可变**；同一版本号不可重复创建
+- **草稿写与发布的并发胜负在数据库层原子判定**（见 7.1）：`PUT`/`DELETE`/`publish`
+  均以 `status='draft'` 为条件的原子写入生效——发布先提交时，旧的改/删请求返回
+  `409 RECIPE_VERSION_IMMUTABLE`，已发布行及其内容不变；`PUT` 先提交时发布会冻结
+  更新后的草稿；`DELETE` 先提交时发布返回 `404 RECIPE_VERSION_NOT_FOUND`，不留快照
 
 ### 3.5 评估（绑定配方版本 + 幂等 + 可选规则集快照）
 
@@ -389,10 +393,44 @@ pytest
 uvicorn app.main:app --reload
 ```
 
+### 7.1 并发复验（草稿改/删 vs 发布）
+
+配方版本的 `PUT`/`DELETE`/`publish` 在数据库层以 `status='draft'` 条件写入
+（compare-and-swap）建立原子胜负顺序，不靠应用层"读后判断"。复验方式：
+
+**① 单元级（pytest，确定性复现交错时序）**
+
+```bash
+pytest tests/test_recipe_concurrency.py -v
+```
+
+每个用例在"请求已读取草稿"与"请求写入"之间注入一个先提交的并发发布/删除，
+断言旧请求得到 `409 RECIPE_VERSION_IMMUTABLE` 或 `404 RECIPE_VERSION_NOT_FOUND`，
+且已发布行内容不变、被删版本不留快照。
+
+**② 服务级（对 Docker Compose 部署真实并发压测）**
+
+```bash
+docker compose up --build -d
+bash examples/concurrency_check.sh     # 默认各 20 轮；ROUNDS=100 可加多
+```
+
+脚本每轮对同一草稿同时发起 `PUT`+`publish`、`DELETE`+`publish`，随后校验不变量：
+
+- `PUT` 返回 409 ⟺ 已发布内容保持原值；`PUT` 返回 200 ⟺ 发布冻结的是更新后草稿
+- `DELETE` 返回 204 ⟺ 发布返回 404 且版本彻底消失（不留快照）；
+  `DELETE` 返回 409 ⟺ 版本已发布且内容不变
+
+两种胜负都合法，脚本统计各自出现次数；任何不变量被破坏都会以非零码退出。
+
 ## 8. 设计要点
 
 - **不可变性**：原料登记即冻结；单条规则与配方版本经 `publish` 后冻结（改/删 → 409）；
   规则集发布生成不可变版本快照与 SHA-256 摘要，保证任意历史评估可解释、可复现。
+- **数据库层原子胜负**：配方版本的替换、删除、发布都是带 `status='draft'` 条件的
+  原子 `UPDATE`/`DELETE`（影响行数定胜负），并发下已发布行不会被改写或删除；
+  输家按行当前状态返回 `409 RECIPE_VERSION_IMMUTABLE`（已发布）或
+  `404 RECIPE_VERSION_NOT_FOUND`（已删除），发布对并发发布保持幂等。
 - **ppm 归一化与重叠检测**：规则集提交即归一化到 ppm（单位无关），同
   法域/过敏原/`applies_to`/等阈值（含边界）视为重叠；`declare`+`warning`
   并存，`prohibit` 与其他 action 冲突，冲突明细稳定排序并阻断发布。
@@ -424,7 +462,8 @@ app/
     evaluation.py         # 过敏原累积、规则/快照匹配、稳定排序输出
     rule_sets.py          # ppm 归一化、重叠冲突检测、摘要与摘要哈希
   routers/                # ingredients / rules / rule_sets / recipes / evaluations
-tests/                    # pytest（SQLite 内存库，79 个用例）
+tests/                    # pytest（SQLite 内存库，88 个用例；test_recipe_concurrency.py 专测并发胜负）
 examples/quickstart.sh    # 端到端 curl 示例（含规则集发布、冲突与快照重放）
+examples/concurrency_check.sh  # 草稿改/删 vs 发布的并发复验脚本（对运行中的 API）
 Dockerfile / docker-compose.yml
 ```
