@@ -49,10 +49,39 @@ def _get_version_or_404(db: Session, recipe: Recipe, version: int) -> RecipeVers
         .first()
     )
     if rv is None:
-        raise api_error(
-            404, "RECIPE_VERSION_NOT_FOUND", f"recipe {recipe.code!r} has no version {version}"
-        )
+        raise _version_not_found(recipe.code, version)
     return rv
+
+
+def _version_not_found(code: str, version: int):
+    return api_error(
+        404, "RECIPE_VERSION_NOT_FOUND", f"recipe {code!r} has no version {version}"
+    )
+
+
+def _version_immutable(code: str, version: int):
+    return api_error(
+        409,
+        "RECIPE_VERSION_IMMUTABLE",
+        f"recipe {code!r} version {version} is published and immutable",
+    )
+
+
+def _raise_lost_race(db: Session, recipe: Recipe, version: int):
+    """Explain why a conditional draft write matched no row.
+
+    The row was read as a draft but the guarded UPDATE/DELETE did not land,
+    so a concurrent request committed first: either it published the version
+    (the row is now immutable) or it deleted it (the version is gone).
+    """
+    current = (
+        db.query(RecipeVersion)
+        .filter(RecipeVersion.recipe_id == recipe.id, RecipeVersion.version == version)
+        .first()
+    )
+    if current is None:
+        raise _version_not_found(recipe.code, version)
+    raise _version_immutable(recipe.code, version)
 
 
 @router.post("", status_code=201)
@@ -115,18 +144,31 @@ def get_version(code: str, version: int, db: Session = Depends(get_db)):
 def replace_version(
     code: str, version: int, body: RecipeVersionUpdate, db: Session = Depends(get_db)
 ):
-    """Replace a draft version. Published versions are immutable."""
+    """Replace a draft version. Published versions are immutable.
+
+    The draft guard is enforced by the database, not by the read above: the
+    UPDATE only lands while the row is still a draft, so a concurrent publish
+    always wins and this request then fails with 409 instead of rewriting
+    published content.
+    """
     recipe = _get_recipe_or_404(db, code)
     rv = _get_version_or_404(db, recipe, version)
-    if rv.status == "published":
-        raise api_error(
-            409,
-            "RECIPE_VERSION_IMMUTABLE",
-            f"recipe {recipe.code!r} version {version} is published and immutable",
+    updated = (
+        db.query(RecipeVersion)
+        .filter(RecipeVersion.id == rv.id, RecipeVersion.status == "draft")
+        .update(
+            {
+                "items": [i.model_dump(mode="json") for i in body.items],
+                "yield_quantity": body.yield_quantity,
+                "yield_unit": body.yield_unit,
+            },
+            synchronize_session=False,
         )
-    rv.items = [i.model_dump(mode="json") for i in body.items]
-    rv.yield_quantity = body.yield_quantity
-    rv.yield_unit = body.yield_unit
+    )
+    if updated != 1:
+        # A concurrent publish or delete committed first; nothing was written.
+        db.rollback()
+        _raise_lost_race(db, recipe, version)
     db.commit()
     db.refresh(rv)
     return serialize_version(rv)
@@ -134,28 +176,59 @@ def replace_version(
 
 @router.delete("/{code}/versions/{version}", status_code=204)
 def delete_version(code: str, version: int, db: Session = Depends(get_db)):
-    """Delete a draft version. Published versions are immutable."""
+    """Delete a draft version. Published versions are immutable.
+
+    The DELETE is guarded by ``status = 'draft'`` in the database, so a
+    version that was published concurrently cannot be removed.
+    """
     recipe = _get_recipe_or_404(db, code)
     rv = _get_version_or_404(db, recipe, version)
-    if rv.status == "published":
-        raise api_error(
-            409,
-            "RECIPE_VERSION_IMMUTABLE",
-            f"recipe {recipe.code!r} version {version} is published and immutable",
-        )
-    db.delete(rv)
+    deleted = (
+        db.query(RecipeVersion)
+        .filter(RecipeVersion.id == rv.id, RecipeVersion.status == "draft")
+        .delete(synchronize_session=False)
+    )
+    if deleted != 1:
+        # A concurrent publish or delete committed first; nothing was written.
+        db.rollback()
+        _raise_lost_race(db, recipe, version)
     db.commit()
     return Response(status_code=204)
 
 
 @router.post("/{code}/versions/{version}/publish")
 def publish_version(code: str, version: int, db: Session = Depends(get_db)):
-    """Publish a recipe version, freezing it forever. Idempotent."""
+    """Publish a recipe version, freezing it forever. Idempotent.
+
+    The draft -> published transition is a single conditional UPDATE, so it
+    races atomically with draft replacement and deletion: it either freezes
+    the newest committed draft content, or fails cleanly when the draft was
+    deleted first (no snapshot is left behind).
+    """
     recipe = _get_recipe_or_404(db, code)
     rv = _get_version_or_404(db, recipe, version)
-    if rv.status != "published":
-        rv.status = "published"
-        rv.published_at = utcnow()
+    if rv.status == "published":
+        return serialize_version(rv)
+    published = (
+        db.query(RecipeVersion)
+        .filter(RecipeVersion.id == rv.id, RecipeVersion.status == "draft")
+        .update(
+            {"status": "published", "published_at": utcnow()},
+            synchronize_session=False,
+        )
+    )
+    if published == 1:
         db.commit()
         db.refresh(rv)
-    return serialize_version(rv)
+        return serialize_version(rv)
+    # Lost the race against a concurrent delete or publish.
+    db.rollback()
+    current = (
+        db.query(RecipeVersion)
+        .filter(RecipeVersion.recipe_id == recipe.id, RecipeVersion.version == version)
+        .first()
+    )
+    if current is None:
+        raise _version_not_found(recipe.code, version)
+    # A concurrent publish won; publishing is idempotent, so replay its state.
+    return serialize_version(current)

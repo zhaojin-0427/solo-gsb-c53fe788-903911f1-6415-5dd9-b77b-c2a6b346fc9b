@@ -320,6 +320,32 @@ curl -X POST http://localhost:8000/evaluations \
 {"detail": {"code": "RECIPE_CYCLE", "cycle": ["a@v1", "b@v1", "a@v1"], "message": "..."}}
 ```
 
+### 3.8 并发复验：草稿写与发布的原子胜负
+
+配方版本的草稿替换（`PUT`）、删除（`DELETE`）与发布（`publish`）在**数据库层**
+以版本状态原子地决定胜负：三个写操作都是带 `status = 'draft'` 守卫的条件
+UPDATE/DELETE，行锁 + 条件重估保证只有一个请求先提交生效，**不存在**
+“读到草稿 → 对方已发布 → 旧写仍然落库”的窗口。因此：
+
+| 竞速 | 先提交者 | 后到请求的结果 | 最终状态 |
+| ---- | ---- | ---- | ---- |
+| PUT vs publish | publish | `409 RECIPE_VERSION_IMMUTABLE` | 已发布行及其内容不变 |
+| PUT vs publish | PUT | publish 200 | 发布冻结**更新后**的草稿 |
+| DELETE vs publish | publish | `409 RECIPE_VERSION_IMMUTABLE` | 已发布行不被删除 |
+| DELETE vs publish | DELETE | `404 RECIPE_VERSION_NOT_FOUND` | 发布不成功，也不留快照 |
+
+一键复验（对运行中的服务并发发起真实竞速，逐轮断言上述不变量）：
+
+```bash
+docker compose up --build          # 启动后另开终端
+bash examples/concurrency_check.sh # 默认 10 轮 × 3 组竞速，可用 ROUNDS=50 加量
+```
+
+脚本同时报告观察到的提交顺序（如 `A_publish_first` / `A_put_first`），
+任一竞速组的不变量被破坏即以非零状态退出。对应的确定性回归测试见
+`tests/test_recipe_version_concurrency.py`（用 SQLAlchemy `load` 事件在
+端点的读窗口内注入并发提交，精确复现竞速交错）。
+
 ## 4. API 一览
 
 | 方法 | 路径 | 说明 |
@@ -337,7 +363,7 @@ curl -X POST http://localhost:8000/evaluations \
 | GET  | `/rule-sets/{code}/versions`、`/rule-sets/{code}/versions/{v}` | 版本摘要列表 / 不可变快照 |
 | POST | `/recipes` | 创建配方 |
 | POST | `/recipes/{code}/versions` | 新增草稿版本（版本号唯一） |
-| PUT/DELETE | `/recipes/{code}/versions/{v}` | 仅草稿可改/删 |
+| PUT/DELETE | `/recipes/{code}/versions/{v}` | 仅草稿可改/删（与发布竞速时由数据库状态原子定胜负；已发布 → 409） |
 | POST | `/recipes/{code}/versions/{v}/publish` | 发布版本（幂等，发布后不可变） |
 | GET  | `/recipes…` | 查询配方及版本 |
 | POST | `/evaluations` | 评估（需 `Idempotency-Key` 头或 `idempotency_key`；可选 `rule_set_code`+`rule_set_version`） |
@@ -392,6 +418,9 @@ uvicorn app.main:app --reload
 ## 8. 设计要点
 
 - **不可变性**：原料登记即冻结；单条规则与配方版本经 `publish` 后冻结（改/删 → 409）；
+  配方版本的草稿改/删与发布是**数据库层带状态守卫的条件写**（`status = 'draft'`），
+  竞速时按提交顺序原子定胜负——发布先提交则旧写 `409 RECIPE_VERSION_IMMUTABLE`，
+  已发布行永不被改写或删除，评估始终可依据稳定版本计算；
   规则集发布生成不可变版本快照与 SHA-256 摘要，保证任意历史评估可解释、可复现。
 - **ppm 归一化与重叠检测**：规则集提交即归一化到 ppm（单位无关），同
   法域/过敏原/`applies_to`/等阈值（含边界）视为重叠；`declare`+`warning`
@@ -424,7 +453,8 @@ app/
     evaluation.py         # 过敏原累积、规则/快照匹配、稳定排序输出
     rule_sets.py          # ppm 归一化、重叠冲突检测、摘要与摘要哈希
   routers/                # ingredients / rules / rule_sets / recipes / evaluations
-tests/                    # pytest（SQLite 内存库，79 个用例）
+tests/                    # pytest（SQLite 内存库，88 个用例，含并发竞速回归）
 examples/quickstart.sh    # 端到端 curl 示例（含规则集发布、冲突与快照重放）
+examples/concurrency_check.sh  # 并发复验：草稿写 vs 发布的原子胜负顺序
 Dockerfile / docker-compose.yml
 ```

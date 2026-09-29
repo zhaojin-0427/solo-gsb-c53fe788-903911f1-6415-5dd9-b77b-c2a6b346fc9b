@@ -86,6 +86,25 @@ def test_ingredient_item_cannot_have_version(client):
     assert "version" in resp.text
 
 
+def test_publish_is_idempotent(client):
+    make_recipe(
+        client,
+        "bread",
+        [
+            {
+                "version": 1,
+                "items": [{"kind": "ingredient", "code": "sugar", "quantity": 10, "unit": "g"}],
+            }
+        ],
+    )
+    first = client.post("/recipes/bread/versions/1/publish")
+    assert first.status_code == 200
+    again = client.post("/recipes/bread/versions/1/publish")
+    assert again.status_code == 200
+    assert again.json() == first.json()
+    assert again.json()["published_at"] == first.json()["published_at"]
+
+
 def test_empty_items_rejected(client):
     client.post("/recipes", json={"code": "r", "name": "R"})
     resp = client.post("/recipes/r/versions", json={"version": 1, "items": []})
